@@ -9,7 +9,6 @@
 #include <UniversalTelegramBot.h>
 #include "secrets.h"
 
-
 // ==== OLED config ====
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -18,12 +17,16 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ==== Pin config ====
-const int gasPin    = 34;
 const int pirPin    = 2;
 const int flamePin  = 4;
-const int tempPin   = 15;
 const int ledPin    = 5;
+const int tempPin   = 15;
+const int CameraPin_RX = 16;  // RX2 - receives from CAM TX
+const int CameraPin_TX = 17;  // TX2 - sends to CAM RX
+//const int OledSDA = 21;
+//const int OledSCK = 22;
 const int buzzerPin = 18;
+const int gasPin    = 34;
 
 // ==== Thresholds ====
 const float TEMP_MIN = 6.0;
@@ -38,6 +41,10 @@ UniversalTelegramBot bot(TELEGRAM_TOKEN, client);
 OneWire oneWire(tempPin);
 DallasTemperature tempSensor(&oneWire);
 
+// ==== UART for Camera ====
+HardwareSerial CameraSerial(2); // Use UART2
+const char CAPTURE_CMD = 'C';   // Command to trigger capture
+
 // ==== Global state ====
 struct SensorData {
   int gasValue;
@@ -50,6 +57,7 @@ bool gasAlertState = false;
 bool motionAlertState = false;
 bool flameAlertState = false;
 bool tempAlertState = false;
+bool imageRequested = false; // Track if image was already requested
 
 // -----------------------------------------------------
 // Function declarations
@@ -61,6 +69,7 @@ void logToSerial(const SensorData &data, bool alert);
 void updateDisplay(const SensorData &data, bool alert);
 void handleAlert(bool alert);
 void handleTelegramNotifications(const SensorData &data);
+void handleCameraCapture();
 
 // -----------------------------------------------------
 // Setup
@@ -80,6 +89,7 @@ void loop() {
   logToSerial(data, alert);
   updateDisplay(data, alert);
   handleAlert(alert);
+  handleCameraCapture(); // Check if camera capture needed
   handleTelegramNotifications(data);
 
   delay(500);
@@ -95,6 +105,10 @@ void initializeSystem() {
   pinMode(buzzerPin, OUTPUT);
 
   tempSensor.begin();
+
+  // Initialize Camera UART
+  CameraSerial.begin(115200, SERIAL_8N1, CameraPin_RX, CameraPin_TX);
+  Serial.println("Camera UART initialized");
 
   // Initialize OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -179,6 +193,28 @@ void updateDisplay(const SensorData &data, bool alert) {
 void handleAlert(bool alert) {
   digitalWrite(ledPin, alert ? HIGH : LOW);
   digitalWrite(buzzerPin, alert ? HIGH : LOW);
+}
+
+// -----------------------------------------------------
+// Camera capture logic
+// -----------------------------------------------------
+void handleCameraCapture() {
+  // Check if flame OR motion is detected
+  bool shouldCapture = flameAlertState || motionAlertState;
+  
+  // Only send capture command if:
+  // 1. Flame or motion is currently detected
+  // 2. Image hasn't been requested yet for this alert
+  if (shouldCapture && !imageRequested) {
+    CameraSerial.write(CAPTURE_CMD);
+    Serial.println("📷 Capture command sent to camera!");
+    imageRequested = true;
+  }
+  
+  // Reset imageRequested flag when both alerts are cleared
+  if (!flameAlertState && !motionAlertState) {
+    imageRequested = false;
+  }
 }
 
 // -----------------------------------------------------
