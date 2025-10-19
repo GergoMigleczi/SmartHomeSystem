@@ -265,7 +265,8 @@ void manageCameraCapture() {
       // Check if we should request a capture
       if (shouldRequestCapture()) {
         sendCaptureCommand();
-        cameraState = CAM_WAITING_FOR_IMAGE;
+        //cameraState = CAM_WAITING_FOR_IMAGE;
+        cameraState = CAM_IDLE;
         logStatus("State: WAITING_FOR_IMAGE");
       }
       break;
