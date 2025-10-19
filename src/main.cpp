@@ -137,7 +137,7 @@ void loop() {
   
   manageCameraCapture();  // Handle all camera logic via state machine
   
-  //handleTelegramNotifications();
+  handleTelegramNotifications();
 
   delay(500);
 }
@@ -177,7 +177,7 @@ void initializeSystem() {
   logStatus("Connected!");
 
   client.setInsecure(); // skip certificate check for Telegram
-  //bot.sendMessage(TELEGRAM_CHAT_ID, "ESP32 Safety System is online!", "");
+  bot.sendMessage(TELEGRAM_CHAT_ID, "ESP32 Safety System is online!", "");
 
   delay(2000);
 }
