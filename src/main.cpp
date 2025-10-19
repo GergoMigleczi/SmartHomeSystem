@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <oled.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <WiFi.h>
@@ -14,7 +13,14 @@
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 #define SCREEN_ADDRESS 0x3C
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+OLED display = OLED (21,                       // sda pin for I2C comunication
+         22,                       // scl pin for I2C comunication
+         NO_RESET_PIN,        // Reset pin (default: none)
+         OLED::W_128, // Display width, must be one of enum: W_96 or W_128 (default: W_128).
+         OLED::H_64, // Display height, must be one of enum: H_16, H_32 or OLED::H_64 (default: H_32).
+         OLED::CTRL_SH1106,     //Display controller chip, must be one of enum: CTRL_SH1106 or CTRL_SSD1306 (default: CTRL_SSD1306).                  
+         0x3C               // I2C address (default: 0x3C)
+    );
 
 // ==== Pin config ====
 const int pirPin    = 2;
@@ -102,10 +108,8 @@ void manageCameraCapture();
 bool shouldRequestCapture();
 void sendCaptureCommand();
 bool tryReceiveImageData();
-void freeImageBuffer();
 
 void handleTelegramNotifications();
-void sendImageToTelegram();
 
 void logStatus(const char* message);
 void logStatusf(const char* format, ...);
@@ -133,7 +137,7 @@ void loop() {
   
   manageCameraCapture();  // Handle all camera logic via state machine
   
-  handleTelegramNotifications();
+  //handleTelegramNotifications();
 
   delay(500);
 }
@@ -154,20 +158,18 @@ void initializeSystem() {
   logStatus("Camera UART initialized");
 
   // Initialize OLED
-  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    logStatus("SSD1306 allocation failed");
-    while (true);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(F("System Initializing..."));
+  display.begin();
+  display.clear();
+  display.noInverse();
+  display.drawString(2,1,"System Initialising...");
   display.display();
+  
 
   // Wi-Fi connection
   logStatus("Connecting to Wi-Fi");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  display.drawString(2,2,"Connecting to Wifi...");
+  display.display();
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
@@ -175,7 +177,7 @@ void initializeSystem() {
   logStatus("Connected!");
 
   client.setInsecure(); // skip certificate check for Telegram
-  bot.sendMessage(TELEGRAM_CHAT_ID, "ESP32 Safety System is online!", "");
+  //bot.sendMessage(TELEGRAM_CHAT_ID, "ESP32 Safety System is online!", "");
 
   delay(2000);
 }
@@ -187,7 +189,8 @@ SensorData readSensors() {
   SensorData data;
   data.gasValue = analogRead(gasPin);
   data.motionDetected = digitalRead(pirPin);
-  data.flameDetected = digitalRead(flamePin);
+  data.flameDetected = (digitalRead(flamePin) == 1 ? false : true);
+  Serial.println("Flame sensor read: " + String(digitalRead(flamePin)));
   tempSensor.requestTemperatures();
   data.temperature = tempSensor.getTempCByIndex(0);
   return data;
@@ -229,31 +232,28 @@ void logSensorData(const SensorData &data, bool alert) {
 }
 
 void updateDisplay(const SensorData &data, bool alert) {
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.setTextSize(1);
+  display.clear();
 
-  display.print("Gas: ");
-  display.println(data.gasValue > GAS_THRESHOLD ? "ALERT" : "OK");
+  char tempStr[8];
+  dtostrf(data.temperature, 0, 1, tempStr);
 
-  display.print("Motion: ");
-  display.println(data.motionDetected ? "YES" : "NO");
-
-  display.print("Flame: ");
-  display.println(data.flameDetected ? "YES" : "NO");
-
-  display.print("Temp: ");
-  display.print(data.temperature, 1);
-  display.println("C");
-
-  display.setTextSize(2);
-  display.println(alert ? "ALERT!" : "Status OK");
+  display.noInverse();
+  display.drawString(2,1,"Flame: ");
+  display.drawString(15,1, data.flameDetected ? "YES" : "NO");
+  display.drawString(2,2,"Motion: ");
+  display.drawString(15,2,data.motionDetected ? "YES" : "NO");
+  display.drawString(2,3,"Gas: ");
+  display.drawString(15,3,data.gasValue > GAS_THRESHOLD ? "ALERT" : "OK");
+  display.drawString(2,4,"Temperature: ");
+  display.drawString(15,4,tempStr);
+  display.inverse();
+  display.drawString(2,6, alert ? "ALERT!" : "Status OK"); // first line
   display.display();
 }
 
 void handleLocalAlert(bool alert) {
   digitalWrite(ledPin, alert ? HIGH : LOW);
-  digitalWrite(buzzerPin, alert ? HIGH : LOW);
+  //digitalWrite(buzzerPin, alert ? HIGH : LOW);
 }
 
 // -----------------------------------------------------
@@ -381,19 +381,6 @@ bool tryReceiveImageData() {
 }
 
 // -----------------------------------------------------
-// Free image buffer memory
-// -----------------------------------------------------
-void freeImageBuffer() {
-  if (capturedImage.buffer != NULL) {
-    free(capturedImage.buffer);
-    capturedImage.buffer = NULL;
-  }
-  capturedImage.size = 0;
-  capturedImage.bytesRead = 0;
-  capturedImage.available = false;
-}
-
-// -----------------------------------------------------
 // Telegram notification logic
 // -----------------------------------------------------
 void handleTelegramNotifications() {
@@ -419,73 +406,8 @@ void handleTelegramNotifications() {
 
   // Send image if available
   if (capturedImage.available && cameraState == CAM_IMAGE_READY) {
-    sendImageToTelegram();
+    //send image
   }
-}
-
-// -----------------------------------------------------
-// Telegram Image Upload Callbacks
-// -----------------------------------------------------
-static uint32_t imageUploadIndex = 0;
-
-// Check if more data is available
-bool imageMoreDataAvailable() {
-  return imageUploadIndex < capturedImage.size;
-}
-
-// Get next byte
-uint8_t imageGetNextByte() {
-  return capturedImage.buffer[imageUploadIndex++];
-}
-
-// Get pointer to next buffer chunk
-uint8_t* imageGetNextBuffer() {
-  return capturedImage.buffer + imageUploadIndex;
-}
-
-// Get length of next buffer chunk
-int imageGetNextBufferLen() {
-  const int CHUNK_SIZE = 1024;
-  int remaining = capturedImage.size - imageUploadIndex;
-  int chunkSize = min(CHUNK_SIZE, remaining);
-  imageUploadIndex += chunkSize;
-  return chunkSize;
-}
-
-// -----------------------------------------------------
-// Send image to Telegram
-// -----------------------------------------------------
-void sendImageToTelegram() {
-  logStatusf("Sending image to Telegram (%d bytes)", capturedImage.size);
-  
-  // Reset upload index
-  imageUploadIndex = 0;
-  
-  // Send photo to Telegram using the correct API
-  String response = bot.sendMultipartFormDataToTelegram(
-    "sendPhoto",
-    "photo",
-    "image.jpg",
-    "image/jpeg",
-    TELEGRAM_CHAT_ID,
-    capturedImage.size,
-    imageMoreDataAvailable,
-    imageGetNextByte,
-    imageGetNextBuffer,
-    imageGetNextBufferLen
-  );
-  
-  if (response.indexOf("\"ok\":true") > 0) {
-    logStatus("✅ Image sent successfully!");
-  } else {
-    logStatus("❌ Failed to send image");
-    logStatusf("Response: %s", response.c_str());
-  }
-  
-  // Clean up and reset state
-  freeImageBuffer();
-  cameraState = CAM_IDLE;
-  logStatus("State: IDLE");
 }
 
 // -----------------------------------------------------
