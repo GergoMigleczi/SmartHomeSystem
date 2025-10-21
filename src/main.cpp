@@ -41,6 +41,7 @@ const int GAS_THRESHOLD = 3000;
 
 // ==== Wi-Fi & Telegram ====
 WiFiClientSecure client;
+const char* telegramHost = "api.telegram.org"; // Telegram API server host
 UniversalTelegramBot bot(TELEGRAM_TOKEN, client);
 
 // ==== Temperature setup ====
@@ -49,10 +50,12 @@ DallasTemperature tempSensor(&oneWire);
 
 // ==== UART for Camera ====
 HardwareSerial CameraSerial(2); // Use UART2
+const int UART_BAUD_RATE = 115200;
 const char CAPTURE_CMD = 'C';   // Command to trigger capture
 const char RESPONSE_START = 'S'; // Start of image transmission
 const char RESPONSE_END = 'E';   // End of image transmission
 const char RESPONSE_ERROR = 'X'; // Error during capture
+const char RESPONSE_ACK = 'A';  // Acknowledgment
 
 // ==== Camera State Machine ====
 enum CameraState {
@@ -68,10 +71,11 @@ struct ImageData {
   uint8_t* buffer;      // Image bytes
   uint32_t size;        // Image size
   uint32_t bytesRead;   // Bytes received so far
+  float progress;      // Progress percentage
   bool available;       // Is image ready to send?
 };
 
-ImageData capturedImage = {NULL, 0, 0, false};
+ImageData capturedImage = {NULL, 0, 0, 0.0, false};
 
 // ==== Sensor Data Structure ====
 struct SensorData {
@@ -110,6 +114,9 @@ void sendCaptureCommand();
 bool tryReceiveImageData();
 
 void handleTelegramNotifications();
+void sendPhotoToTelegram(uint8_t* buffer, size_t length);
+
+void freeImageBuffer(ImageData &image);
 
 void logStatus(const char* message);
 void logStatusf(const char* format, ...);
@@ -154,7 +161,7 @@ void initializeSystem() {
   tempSensor.begin();
 
   // Initialize Camera UART
-  CameraSerial.begin(115200, SERIAL_8N1, CameraPin_RX, CameraPin_TX);
+  CameraSerial.begin(UART_BAUD_RATE, SERIAL_8N1, CameraPin_RX, CameraPin_TX);
   logStatus("Camera UART initialized");
 
   // Initialize OLED
@@ -190,7 +197,6 @@ SensorData readSensors() {
   data.gasValue = analogRead(gasPin);
   data.motionDetected = digitalRead(pirPin);
   data.flameDetected = (digitalRead(flamePin) == 1 ? false : true);
-  Serial.println("Flame sensor read: " + String(digitalRead(flamePin)));
   tempSensor.requestTemperatures();
   data.temperature = tempSensor.getTempCByIndex(0);
   return data;
@@ -237,6 +243,9 @@ void updateDisplay(const SensorData &data, bool alert) {
   char tempStr[8];
   dtostrf(data.temperature, 0, 1, tempStr);
 
+  char imgProgressStr[8];
+  dtostrf(capturedImage.progress, 0, 1, imgProgressStr);
+
   display.noInverse();
   display.drawString(2,1,"Flame: ");
   display.drawString(15,1, data.flameDetected ? "YES" : "NO");
@@ -246,8 +255,13 @@ void updateDisplay(const SensorData &data, bool alert) {
   display.drawString(15,3,data.gasValue > GAS_THRESHOLD ? "ALERT" : "OK");
   display.drawString(2,4,"Temperature: ");
   display.drawString(15,4,tempStr);
+  if(cameraState == CAM_WAITING_FOR_IMAGE) {
+    display.drawString(2,5,"Image: ");
+    display.drawString(9,5,imgProgressStr);
+    display.drawString(13,5,"%");
+  }
   display.inverse();
-  display.drawString(2,6, alert ? "ALERT!" : "Status OK"); // first line
+  display.drawString(2,7, alert ? "ALERT!" : "Status OK"); // first line
   display.display();
 }
 
@@ -266,7 +280,7 @@ void manageCameraCapture() {
       if (shouldRequestCapture()) {
         sendCaptureCommand();
         //cameraState = CAM_WAITING_FOR_IMAGE;
-        cameraState = CAM_IDLE;
+        cameraState = CAM_WAITING_FOR_IMAGE;
         logStatus("State: WAITING_FOR_IMAGE");
       }
       break;
@@ -311,9 +325,13 @@ void sendCaptureCommand() {
 bool tryReceiveImageData() {
   static enum {WAIT_START, READ_SIZE, READ_DATA, WAIT_END} receiveState = WAIT_START;
   static uint32_t expectedSize = 0;
-  
+  static uint32_t lastByteTime = 0; // last time a byte was received
+  const size_t CHUNK_SIZE = 128;
+  const unsigned long  CHUNK_TIMEOUT_MS = 5000; // 2 seconds timeout
+
   while (CameraSerial.available() > 0) {
     char incomingByte = CameraSerial.read();
+    lastByteTime = millis(); // reset timeout counter whenever a byte arrives
     
     switch(receiveState) {
       case WAIT_START:
@@ -358,9 +376,17 @@ bool tryReceiveImageData() {
         }
         break;
         
-      case READ_DATA:
+      case READ_DATA: 
         capturedImage.buffer[capturedImage.bytesRead++] = incomingByte;
+        capturedImage.progress = (float)capturedImage.bytesRead / capturedImage.size * 100.0;
         
+        // Send ACK for every CHUNK_SIZE bytes received
+        if (capturedImage.bytesRead % CHUNK_SIZE == 0 || capturedImage.bytesRead == capturedImage.size) {
+            CameraSerial.write(RESPONSE_ACK);
+        }
+        
+        logStatusf("Image receive pending: %.1f%%, %d bytes", capturedImage.progress, capturedImage.bytesRead);
+
         if (capturedImage.bytesRead >= capturedImage.size) {
           logStatusf("Received all %d bytes", capturedImage.bytesRead);
           receiveState = WAIT_END;
@@ -378,7 +404,18 @@ bool tryReceiveImageData() {
     }
   }
   
-  return false;
+  // Check timeout
+    if ((receiveState != WAIT_START) && (millis() - lastByteTime > CHUNK_TIMEOUT_MS)) {
+        logStatus("❌ Timeout waiting for image data");
+        receiveState = WAIT_START;
+        if (capturedImage.buffer) {
+            free(capturedImage.buffer);
+            capturedImage.buffer = nullptr;
+        }
+        return false;
+    }
+
+    return false;
 }
 
 // -----------------------------------------------------
@@ -407,9 +444,72 @@ void handleTelegramNotifications() {
 
   // Send image if available
   if (capturedImage.available && cameraState == CAM_IMAGE_READY) {
-    //send image
+    sendPhotoToTelegram(capturedImage.buffer, capturedImage.size);
+    freeImageBuffer(capturedImage);
+    cameraState = CAM_IDLE;
   }
 }
+
+
+void sendPhotoToTelegram(uint8_t* buffer, size_t length) {
+
+  if (!buffer || length == 0) {
+    logStatus("No image data to send!");
+    return;
+  }
+
+  if (!client.connect(telegramHost, 443)) {
+    logStatus("Connection to Telegram failed!");
+    return;
+  }
+
+  String boundary = "ESP32CAMBOUNDARY";
+
+  String head = "--" + boundary + "\r\n"
+                "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
+                TELEGRAM_CHAT_ID +
+                "\r\n--" + boundary + "\r\n"
+                "Content-Disposition: form-data; name=\"photo\"; filename=\"photo.jpg\"\r\n"
+                "Content-Type: image/jpeg\r\n\r\n";
+
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  uint32_t totalLen = head.length() + length + tail.length();
+
+  client.printf("POST /bot%s/sendPhoto HTTP/1.1\r\n", TELEGRAM_TOKEN);
+  client.printf("Host: %s\r\n", telegramHost);
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.printf("Content-Length: %d\r\n\r\n", totalLen);
+
+  client.print(head);
+  client.write(buffer, length);
+  client.print(tail);
+
+  // --- Read Telegram server response (optional) ---
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+
+  String response = client.readString();
+  Serial.println("[MAIN] Telegram response:");
+  Serial.println(response);
+}
+
+// -----------------------------------------------------
+// Free the captured image buffer and reset the ImageData struct
+// -----------------------------------------------------
+void freeImageBuffer(ImageData &image) {
+    if (image.buffer != nullptr) {
+        free(image.buffer);       // Free the allocated memory
+        image.buffer = nullptr;   // Avoid dangling pointer
+    }
+    image.size = 0;
+    image.bytesRead = 0;
+    image.progress = 0.0f;
+    image.available = false;
+}
+
 
 // -----------------------------------------------------
 // Logging Functions
