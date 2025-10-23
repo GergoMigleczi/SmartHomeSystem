@@ -56,6 +56,7 @@ const char RESPONSE_START = 'S'; // Start of image transmission
 const char RESPONSE_END = 'E';   // End of image transmission
 const char RESPONSE_ERROR = 'X'; // Error during capture
 const char RESPONSE_ACK = 'A';  // Acknowledgment
+const char BLINK_CMD = 'B'; // Command to blink LED
 
 // ==== Camera State Machine ====
 enum CameraState {
@@ -85,11 +86,14 @@ struct SensorData {
   float temperature;
 };
 
+SensorData currentSensorData {0, false, false, 0.0};
+
 // ==== Alert State Tracking ====
 bool gasAlertState = false;
 bool motionAlertState = false;
 bool flameAlertState = false;
 bool tempAlertState = false;
+bool systemAlertState = false;
 
 // Previous states for edge detection
 bool prevGasAlertState = false;
@@ -110,7 +114,7 @@ void handleLocalAlert(bool alert);
 
 void manageCameraCapture();
 bool shouldRequestCapture();
-void sendCaptureCommand();
+void sendCommandToCamera(char command);
 bool tryReceiveImageData();
 
 void handleTelegramNotifications();
@@ -133,14 +137,14 @@ void setup() {
 // Main loop
 // -----------------------------------------------------
 void loop() {
-  SensorData data = readSensors();
-  bool alert = checkForAlerts(data);
+  currentSensorData = readSensors();
+  systemAlertState = checkForAlerts(currentSensorData);
 
-  updateAlertStates(data);  // Update global alert states once
+  updateAlertStates(currentSensorData);  // Update global alert states once
   
-  logSensorData(data, alert);
-  updateDisplay(data, alert);
-  handleLocalAlert(alert);
+  //logSensorData(currentSensorData, systemAlertState);
+  updateDisplay(currentSensorData, systemAlertState);
+  handleLocalAlert(systemAlertState);
   
   manageCameraCapture();  // Handle all camera logic via state machine
   
@@ -161,8 +165,11 @@ void initializeSystem() {
   tempSensor.begin();
 
   // Initialize Camera UART
+  CameraSerial.setRxBufferSize(1024);  // increase RX buffer size
+  CameraSerial.setTxBufferSize(1024);  // increase TX buffer size
   CameraSerial.begin(UART_BAUD_RATE, SERIAL_8N1, CameraPin_RX, CameraPin_TX);
   logStatus("Camera UART initialized");
+  sendCommandToCamera(BLINK_CMD); // Blink camera LED to indicate ready
 
   // Initialize OLED
   display.begin();
@@ -278,7 +285,7 @@ void manageCameraCapture() {
     case CAM_IDLE:
       // Check if we should request a capture
       if (shouldRequestCapture()) {
-        sendCaptureCommand();
+        sendCommandToCamera(CAPTURE_CMD);
         //cameraState = CAM_WAITING_FOR_IMAGE;
         cameraState = CAM_WAITING_FOR_IMAGE;
         logStatus("State: WAITING_FOR_IMAGE");
@@ -314,9 +321,9 @@ bool shouldRequestCapture() {
 // -----------------------------------------------------
 // Send capture command to camera board
 // -----------------------------------------------------
-void sendCaptureCommand() {
-  CameraSerial.write(CAPTURE_CMD);
-  logStatus("📷 Capture command sent to camera");
+void sendCommandToCamera(char command) {
+  CameraSerial.write(command);
+  logStatusf("Command sent to camera: %c", command);
 }
 
 // -----------------------------------------------------
@@ -326,8 +333,8 @@ bool tryReceiveImageData() {
   static enum {WAIT_START, READ_SIZE, READ_DATA, WAIT_END} receiveState = WAIT_START;
   static uint32_t expectedSize = 0;
   static uint32_t lastByteTime = 0; // last time a byte was received
-  const size_t CHUNK_SIZE = 128;
-  const unsigned long  CHUNK_TIMEOUT_MS = 5000; // 2 seconds timeout
+  const size_t CHUNK_SIZE = 1024;
+  const unsigned long  CHUNK_TIMEOUT_MS = 15000; // 15 seconds timeout
 
   while (CameraSerial.available() > 0) {
     char incomingByte = CameraSerial.read();
@@ -379,13 +386,13 @@ bool tryReceiveImageData() {
       case READ_DATA: 
         capturedImage.buffer[capturedImage.bytesRead++] = incomingByte;
         capturedImage.progress = (float)capturedImage.bytesRead / capturedImage.size * 100.0;
-        
+
         // Send ACK for every CHUNK_SIZE bytes received
         if (capturedImage.bytesRead % CHUNK_SIZE == 0 || capturedImage.bytesRead == capturedImage.size) {
-            CameraSerial.write(RESPONSE_ACK);
+            sendCommandToCamera(RESPONSE_ACK);
         }
         
-        logStatusf("Image receive pending: %.1f%%, %d bytes", capturedImage.progress, capturedImage.bytesRead);
+        //logStatusf("Image receive pending: %.1f%%, %d bytes", capturedImage.progress, capturedImage.bytesRead);
 
         if (capturedImage.bytesRead >= capturedImage.size) {
           logStatusf("Received all %d bytes", capturedImage.bytesRead);
@@ -412,9 +419,9 @@ bool tryReceiveImageData() {
             free(capturedImage.buffer);
             capturedImage.buffer = nullptr;
         }
+        cameraState = CAM_IDLE;
         return false;
     }
-
     return false;
 }
 
