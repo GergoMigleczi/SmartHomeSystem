@@ -120,6 +120,7 @@ SensorData currentSensorData {0, false, false, 0.0};
 SensorData thingSpeakSensorData {0, false, false, TEMP_MIN};
 
 // ==== Alert State Tracking ====
+bool systemAlertState = false;
 bool gasAlertState = false;
 bool motionAlertState = false;
 bool flameAlertState = false;
@@ -127,6 +128,7 @@ bool tempAlertState = false;
 bool systemAlertState = false;
 
 // Previous states for edge detection
+bool prevSystemAlertState = false;
 bool prevGasAlertState = false;
 bool prevMotionAlertState = false;
 bool prevFlameAlertState = false;
@@ -138,10 +140,10 @@ bool prevTempAlertState = false;
 void initializeSystem();
 SensorData readSensors();
 bool checkForAlerts();
-void updateAlertStates(const SensorData &data);
-void logSensorData(const SensorData &data, bool alert);
-void updateDisplay(const SensorData &data, bool alert);
-void handleLocalAlert(bool alert);
+void updateAlertStates();
+void logSensorData();
+void updateDisplay();
+void handleLocalAlert();
 
 void updateThingSpeakSensorData();
 void sendToThingSpeak();
@@ -177,14 +179,11 @@ void loop() {
   currentSensorData = readSensors();
 
   // Update global alert states once
-  updateAlertStates(currentSensorData);  
+  updateAlertStates();  
 
-  // Determine overall system alert state
-  systemAlertState = checkForAlerts();
-
-  //logSensorData(currentSensorData, systemAlertState);
-  updateDisplay(currentSensorData, systemAlertState);
-  handleLocalAlert(systemAlertState);
+  //logSensorData();
+  updateDisplay();
+  handleLocalAlert();
   
   // Handle Telegram commands
   handleTelegramCommands();
@@ -272,51 +271,53 @@ bool checkForAlerts() {
 // -----------------------------------------------------
 // Update global alert states from sensor data
 // -----------------------------------------------------
-void updateAlertStates(const SensorData &data) {
+void updateAlertStates() {
   // Store previous states for edge detection
   prevGasAlertState = gasAlertState;
   prevMotionAlertState = motionAlertState;
   prevFlameAlertState = flameAlertState;
   prevTempAlertState = tempAlertState;
+  prevSystemAlertState = systemAlertState;
   
   // Update current states
-  gasAlertState = data.gasValue > GAS_THRESHOLD;
-  motionAlertState = data.motionDetected;
-  flameAlertState = data.flameDetected;
-  tempAlertState = (data.temperature < TEMP_MIN || data.temperature > TEMP_MAX);
+  gasAlertState = currentSensorData.gasValue > GAS_THRESHOLD;
+  motionAlertState = currentSensorData.motionDetected;
+  flameAlertState = currentSensorData.flameDetected;
+  tempAlertState = (currentSensorData.temperature < TEMP_MIN || currentSensorData.temperature > TEMP_MAX);
+  systemAlertState = checkForAlerts();
 }
 
 // -----------------------------------------------------
 // Log sensor data to Serial
 // -----------------------------------------------------
-void logSensorData(const SensorData &data, bool alert) {
+void logSensorData() {
   logStatusf("Gas: %d | Motion: %s | Flame: %s | Temp: %.1f°C%s",
-           data.gasValue,
-           data.motionDetected ? "YES" : "NO",
-           data.flameDetected ? "YES" : "NO",
-           data.temperature,
-           alert ? " [ALERT]" : "");
+           currentSensorData.gasValue,
+           currentSensorData.motionDetected ? "YES" : "NO",
+           currentSensorData.flameDetected ? "YES" : "NO",
+           currentSensorData.temperature,
+           systemAlertState ? " [ALERT]" : "");
 }
 
 // -----------------------------------------------------
 // Update Local OLED Display
 // -----------------------------------------------------
-void updateDisplay(const SensorData &data, bool alert) {
+void updateDisplay() {
   display.clear();
 
   char tempStr[8];
-  dtostrf(data.temperature, 0, 1, tempStr);
+  dtostrf(currentSensorData.temperature, 0, 1, tempStr);
 
   char imgProgressStr[8];
   dtostrf(capturedImage.progress, 0, 1, imgProgressStr);
 
   display.noInverse();
   display.drawString(2,1,"Flame: ");
-  display.drawString(15,1, data.flameDetected ? "YES" : "NO");
+  display.drawString(15,1, currentSensorData.flameDetected ? "YES" : "NO");
   display.drawString(2,2,"Motion: ");
-  display.drawString(15,2,data.motionDetected ? "YES" : "NO");
+  display.drawString(15,2,currentSensorData.motionDetected ? "YES" : "NO");
   display.drawString(2,3,"Gas: ");
-  display.drawString(15,3,data.gasValue > GAS_THRESHOLD ? "ALERT" : "OK");
+  display.drawString(15,3,currentSensorData.gasValue > GAS_THRESHOLD ? "ALERT" : "OK");
   display.drawString(2,4,"Temperature: ");
   display.drawString(15,4,tempStr);
   if(isReceivingImage()) {
@@ -325,13 +326,13 @@ void updateDisplay(const SensorData &data, bool alert) {
     display.drawString(13,5,"%");
   }
   display.inverse();
-  display.drawString(2,7, alert ? "ALERT!" : "Status OK"); // first line
+  display.drawString(2,7, systemAlertState ? "ALERT!" : "Status OK"); // first line
   display.display();
 }
 
-void handleLocalAlert(bool alert) {
-  digitalWrite(ledPin, alert ? HIGH : LOW);
-  //digitalWrite(buzzerPin, alert ? HIGH : LOW);
+void handleLocalAlert() {
+  digitalWrite(ledPin, systemAlertState ? HIGH : LOW);
+  //digitalWrite(buzzerPin, systemAlertState ? HIGH : LOW);
 }
 
 // -----------------------------------------------------
