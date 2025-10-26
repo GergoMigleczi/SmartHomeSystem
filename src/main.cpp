@@ -6,21 +6,27 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
+#include <ThingSpeak.h>
 #include "secrets.h"
+
+// ==== Debugging ====
+const bool DEBUG = true;
 
 // ==== OLED config ====
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 #define SCREEN_ADDRESS 0x3C
-OLED display = OLED (21,                       // sda pin for I2C comunication
-         22,                       // scl pin for I2C comunication
-         NO_RESET_PIN,        // Reset pin (default: none)
-         OLED::W_128, // Display width, must be one of enum: W_96 or W_128 (default: W_128).
-         OLED::H_64, // Display height, must be one of enum: H_16, H_32 or OLED::H_64 (default: H_32).
-         OLED::CTRL_SH1106,     //Display controller chip, must be one of enum: CTRL_SH1106 or CTRL_SSD1306 (default: CTRL_SSD1306).                  
-         0x3C               // I2C address (default: 0x3C)
-    );
+
+OLED display = OLED (
+  21,                  // sda pin for I2C comunication
+  22,                  // scl pin for I2C comunication
+  NO_RESET_PIN,        // Reset pin (default: none)
+  OLED::W_128,         // Display width, must be one of enum: W_96 or W_128 (default: W_128).
+  OLED::H_64,          // Display height, must be one of enum: H_16, H_32 or OLED::H_64 (default: H_32).
+  OLED::CTRL_SH1106,   // Display controller chip, must be one of enum: CTRL_SH1106 or CTRL_SSD1306 (default: CTRL_SSD1306).                  
+  0x3C                 // I2C address (default: 0x3C)
+);
 
 // ==== Pin config ====
 const int pirPin    = 2;
@@ -39,10 +45,34 @@ const float TEMP_MIN = 6.0;
 const float TEMP_MAX = 30.0;
 const int GAS_THRESHOLD = 3000;
 
-// ==== Wi-Fi & Telegram ====
+// ==== Wi-Fi ====
 WiFiClientSecure client;
+
+// ==== Telegram ====
 const char* telegramHost = "api.telegram.org"; // Telegram API server host
 UniversalTelegramBot bot(TELEGRAM_TOKEN, client);
+
+// ==== Telegram Commands Setup ====
+unsigned long lastTelegramCheck = 0;
+const unsigned long TELEGRAM_INTERVAL = 2000; // check every 2 seconds
+
+bool telegramCommandTakePicture = false;
+bool telegramCommandSendTemp = false;
+
+// ===== ThinkSpeak Cooldown =====
+const unsigned long COOLDOWN = 30000; // 30 seconds - avoid slowing system down by sending readings too frequently
+
+// ===== ThinkSpeak State tracking =====
+unsigned long lastFlameSend = 0;
+unsigned long lastMotionSend = 0;
+unsigned long lastGasSend = 0;
+unsigned long lastTempSend = 0;
+
+// ===== ThinkSpeak Fields =====
+int FIELD_GAS = 1;
+int FIELD_TEMPERATURE = 2;
+int FIELD_FLAME = 3;
+int FIELD_MOTION = 4;
 
 // ==== Temperature setup ====
 OneWire oneWire(tempPin);
@@ -87,6 +117,7 @@ struct SensorData {
 };
 
 SensorData currentSensorData {0, false, false, 0.0};
+SensorData thingSpeakSensorData {0, false, false, TEMP_MIN};
 
 // ==== Alert State Tracking ====
 bool gasAlertState = false;
@@ -106,17 +137,22 @@ bool prevTempAlertState = false;
 // -----------------------------------------------------
 void initializeSystem();
 SensorData readSensors();
-bool checkForAlerts(const SensorData &data);
+bool checkForAlerts();
 void updateAlertStates(const SensorData &data);
 void logSensorData(const SensorData &data, bool alert);
 void updateDisplay(const SensorData &data, bool alert);
 void handleLocalAlert(bool alert);
 
+void updateThingSpeakSensorData();
+void sendToThingSpeak();
+
 void manageCameraCapture();
 bool shouldRequestCapture();
 void sendCommandToCamera(char command);
 bool tryReceiveImageData();
+bool isReceivingImage();
 
+void handleTelegramCommands();
 void handleTelegramNotifications();
 void sendPhotoToTelegram(uint8_t* buffer, size_t length);
 
@@ -137,19 +173,32 @@ void setup() {
 // Main loop
 // -----------------------------------------------------
 void loop() {
+  // Read sensors
   currentSensorData = readSensors();
-  systemAlertState = checkForAlerts(currentSensorData);
 
-  updateAlertStates(currentSensorData);  // Update global alert states once
-  
+  // Update global alert states once
+  updateAlertStates(currentSensorData);  
+
+  // Determine overall system alert state
+  systemAlertState = checkForAlerts();
+
   //logSensorData(currentSensorData, systemAlertState);
   updateDisplay(currentSensorData, systemAlertState);
   handleLocalAlert(systemAlertState);
   
-  manageCameraCapture();  // Handle all camera logic via state machine
+  // Handle Telegram commands
+  handleTelegramCommands();
+
+  // Handle all camera logic via state machine
+  manageCameraCapture();  
   
+  // Handle Telegram notifications
   handleTelegramNotifications();
 
+  // Send sensor data to ThingSpeak
+  updateThingSpeakSensorData();
+  sendToThingSpeak();
+  
   delay(500);
 }
 
@@ -190,8 +239,12 @@ void initializeSystem() {
   }
   logStatus("Connected!");
 
-  client.setInsecure(); // skip certificate check for Telegram
+  client.setInsecure(); // skip certificate check
   bot.sendMessage(TELEGRAM_CHAT_ID, "ESP32 Safety System is online!", "");
+
+  // Initialise ThingSpeak
+  ThingSpeak.begin(client);
+  logStatus("ThingSpeak initialised");
 
   delay(2000);
 }
@@ -209,10 +262,11 @@ SensorData readSensors() {
   return data;
 }
 
-bool checkForAlerts(const SensorData &data) {
-  bool gasAlert = data.gasValue > GAS_THRESHOLD;
-  bool tempAlert = (data.temperature < TEMP_MIN || data.temperature > TEMP_MAX);
-  return gasAlert || data.motionDetected || data.flameDetected || tempAlert;
+// -----------------------------------------------------
+// Check for any alerts based on sensor data
+// -----------------------------------------------------
+bool checkForAlerts() {
+  return gasAlertState || motionAlertState || flameAlertState || tempAlertState;
 }
 
 // -----------------------------------------------------
@@ -233,7 +287,7 @@ void updateAlertStates(const SensorData &data) {
 }
 
 // -----------------------------------------------------
-// Display and Output
+// Log sensor data to Serial
 // -----------------------------------------------------
 void logSensorData(const SensorData &data, bool alert) {
   logStatusf("Gas: %d | Motion: %s | Flame: %s | Temp: %.1f°C%s",
@@ -244,6 +298,9 @@ void logSensorData(const SensorData &data, bool alert) {
            alert ? " [ALERT]" : "");
 }
 
+// -----------------------------------------------------
+// Update Local OLED Display
+// -----------------------------------------------------
 void updateDisplay(const SensorData &data, bool alert) {
   display.clear();
 
@@ -262,7 +319,7 @@ void updateDisplay(const SensorData &data, bool alert) {
   display.drawString(15,3,data.gasValue > GAS_THRESHOLD ? "ALERT" : "OK");
   display.drawString(2,4,"Temperature: ");
   display.drawString(15,4,tempStr);
-  if(cameraState == CAM_WAITING_FOR_IMAGE) {
+  if(isReceivingImage()) {
     display.drawString(2,5,"Image: ");
     display.drawString(9,5,imgProgressStr);
     display.drawString(13,5,"%");
@@ -278,6 +335,75 @@ void handleLocalAlert(bool alert) {
 }
 
 // -----------------------------------------------------
+// Update ThingSpeak
+// -----------------------------------------------------
+void updateThingSpeakSensorData() {
+  // Gas
+  if (!(thingSpeakSensorData.gasValue > GAS_THRESHOLD)) {
+    thingSpeakSensorData.gasValue = currentSensorData.gasValue;
+  }
+
+  // Temperature
+  if (!((thingSpeakSensorData.temperature < TEMP_MIN || thingSpeakSensorData.temperature > TEMP_MAX))) {
+    thingSpeakSensorData.temperature = currentSensorData.temperature;
+  }
+
+  // Motion
+  if (!(thingSpeakSensorData.motionDetected)) {
+    thingSpeakSensorData.motionDetected = currentSensorData.motionDetected;
+  }
+
+  // Flame
+  if (!(thingSpeakSensorData.flameDetected)) {
+    thingSpeakSensorData.flameDetected = currentSensorData.flameDetected;
+  }
+}
+
+void sendToThingSpeak() {
+  static unsigned long lastSendTime = 0; // persists across calls
+  unsigned long now = millis();
+
+  if (now - lastSendTime < COOLDOWN) {
+    // Cooldown not over yet — skip sending
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    logStatus("Cannot update ThingSpeak - WiFi not connected");
+    return;
+  }
+
+  if (!client.connect("api.thingspeak.com", 443)) {
+    logStatus("Connection to ThingSpeak failed");
+    return;
+  }
+
+  // Build the request URL
+  String url = "/update?api_key=" + String(THINGSPEAK_API_KEY);
+  url += "&field" + String(FIELD_GAS) + "=" + String(thingSpeakSensorData.gasValue, 2)
+  += "&field" + String(FIELD_TEMPERATURE) + "=" + String(thingSpeakSensorData.temperature, 2)
+  += "&field" + String(FIELD_MOTION) + "=" + String(thingSpeakSensorData.motionDetected ? 1 : 0, 2)
+  += "&field" + String(FIELD_FLAME) + "=" + String(thingSpeakSensorData.flameDetected ? 1 : 0, 2); 
+  // Build the GET request
+  String request = String("GET ") + url + " HTTP/1.1\r\n" +
+                   "Host: api.thingspeak.com\r\n" +
+                   "Connection: close\r\n\r\n";
+
+  logStatusf("Sending to ThingSpeak: %s", url.c_str());
+  client.print(request);
+
+  // Optionally read response (the channel entry number or 0 if failed)
+  String response = client.readString();
+  logStatusf("ThingSpeak response: %s", response.c_str());
+  client.stop();
+
+  lastSendTime = now;
+  thingSpeakSensorData = {0, false, false, TEMP_MIN};
+
+}
+
+
+// -----------------------------------------------------
 // Camera State Machine
 // -----------------------------------------------------
 void manageCameraCapture() {
@@ -285,8 +411,13 @@ void manageCameraCapture() {
     case CAM_IDLE:
       // Check if we should request a capture
       if (shouldRequestCapture()) {
+        // reset command flag
+        telegramCommandTakePicture = false; 
+
+        // Send capture command
         sendCommandToCamera(CAPTURE_CMD);
-        //cameraState = CAM_WAITING_FOR_IMAGE;
+
+        // Move to waiting state
         cameraState = CAM_WAITING_FOR_IMAGE;
         logStatus("State: WAITING_FOR_IMAGE");
       }
@@ -315,7 +446,7 @@ bool shouldRequestCapture() {
   bool flameTriggered = flameAlertState && !prevFlameAlertState;
   bool motionTriggered = motionAlertState && !prevMotionAlertState;
   
-  return flameTriggered || motionTriggered;
+  return flameTriggered || motionTriggered || telegramCommandTakePicture;
 }
 
 // -----------------------------------------------------
@@ -425,6 +556,45 @@ bool tryReceiveImageData() {
     return false;
 }
 
+bool isReceivingImage() {
+  return (cameraState == CAM_WAITING_FOR_IMAGE);
+}
+
+// -----------------------------------------------------
+// Handle Telegram Commands
+// -----------------------------------------------------
+void handleTelegramCommands() {
+  if (millis() - lastTelegramCheck < TELEGRAM_INTERVAL) return;
+  lastTelegramCheck = millis();
+
+  int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+
+  while (numNewMessages) {
+    for (int i = 0; i < numNewMessages; i++) {
+      String chat_id = bot.messages[i].chat_id;
+      String text = bot.messages[i].text;
+      text.toLowerCase(); // easier command matching
+
+      if (text == "/temp" || text == "/temperature") {
+        telegramCommandSendTemp = true;
+      } 
+      else if (text == "/pic" || text == "/picture" || text == "/image") {
+        telegramCommandTakePicture = true;
+      }
+      else if (text == "/help") {
+        String help = "Available commands:\n";
+        help += "/temp or /temperature - Get current temperature\n";
+        help += "/pic or /picture or /image - Take a photo";
+        bot.sendMessage(chat_id, help, "");
+      } 
+      else {
+        bot.sendMessage(chat_id, "Unknown command. Try /help", "");
+      }
+    }
+    numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+  }
+}
+
 // -----------------------------------------------------
 // Telegram notification logic
 // -----------------------------------------------------
@@ -444,6 +614,13 @@ void handleTelegramNotifications() {
   if (tempAlertState && !prevTempAlertState) {
     message += "🌡️ Temperature out of range!\n";
   }
+  if(telegramCommandSendTemp){
+    message += "🌡️ Current Temperature: ";
+    char tempStr[8];
+    dtostrf(currentSensorData.temperature, 0, 1, tempStr);
+    message += String(tempStr) + "°C\n";
+    telegramCommandSendTemp = false;
+  }
 
   if (message.length() > 0) {
     bot.sendMessage(TELEGRAM_CHAT_ID, message, "");
@@ -457,7 +634,9 @@ void handleTelegramNotifications() {
   }
 }
 
-
+// -----------------------------------------------------
+// Telegram Photo logic
+// -----------------------------------------------------
 void sendPhotoToTelegram(uint8_t* buffer, size_t length) {
 
   if (!buffer || length == 0) {
@@ -501,6 +680,8 @@ void sendPhotoToTelegram(uint8_t* buffer, size_t length) {
   String response = client.readString();
   Serial.println("[MAIN] Telegram response:");
   Serial.println(response);
+
+   client.stop();
 }
 
 // -----------------------------------------------------
@@ -522,11 +703,15 @@ void freeImageBuffer(ImageData &image) {
 // Logging Functions
 // -----------------------------------------------------
 void logStatus(const char* message) {
+  if(!DEBUG) return; // Skip if debugging is disabled
+
   Serial.print("[MAIN] ");
   Serial.println(message);
 }
 
 void logStatusf(const char* format, ...) {
+  if(!DEBUG) return; // Skip if debugging is disabled
+
   char buffer[256];
   va_list args;
   va_start(args, format);
