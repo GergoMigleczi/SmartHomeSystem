@@ -35,8 +35,6 @@ const int ledPin    = 5;
 const int tempPin   = 15;
 const int CameraPin_RX = 16;  // RX2 - receives from CAM TX
 const int CameraPin_TX = 17;  // TX2 - sends to CAM RX
-//const int OledSDA = 21;
-//const int OledSCK = 22;
 const int buzzerPin = 18;
 const int gasPin    = 34;
 
@@ -59,16 +57,10 @@ const unsigned long TELEGRAM_INTERVAL = 2000; // check every 2 seconds
 bool telegramCommandTakePicture = false;
 bool telegramCommandSendTemp = false;
 
-// ===== ThinkSpeak Cooldown =====
+// ===== ThingSpeak Cooldown =====
 const unsigned long COOLDOWN = 30000; // 30 seconds - avoid slowing system down by sending readings too frequently
 
-// ===== ThinkSpeak State tracking =====
-unsigned long lastFlameSend = 0;
-unsigned long lastMotionSend = 0;
-unsigned long lastGasSend = 0;
-unsigned long lastTempSend = 0;
-
-// ===== ThinkSpeak Fields =====
+// ===== ThingSpeak Fields =====
 int FIELD_GAS = 1;
 int FIELD_TEMPERATURE = 2;
 int FIELD_FLAME = 3;
@@ -117,22 +109,47 @@ struct SensorData {
 };
 
 SensorData currentSensorData {0, false, false, 0.0};
-SensorData thingSpeakSensorData {0, false, false, TEMP_MIN};
 
-// ==== Alert State Tracking ====
-bool systemAlertState = false;
-bool gasAlertState = false;
-bool motionAlertState = false;
-bool flameAlertState = false;
-bool tempAlertState = false;
-bool systemAlertState = false;
+// ==== ThingSpeak Sensor Data Structure ====
+template <typename T>
+struct Field {
+  T value;
+  bool frozen = false;
+};
 
-// Previous states for edge detection
-bool prevSystemAlertState = false;
-bool prevGasAlertState = false;
-bool prevMotionAlertState = false;
-bool prevFlameAlertState = false;
-bool prevTempAlertState = false;
+struct ThingSpeakSensorData {
+  Field<int> gasValue;
+  Field<bool> motionDetected;
+  Field<bool> flameDetected;
+  Field<float> temperature;
+};
+ThingSpeakSensorData thingSpeakSensorData;
+
+// ==== Alert State Management Structure ====
+struct AlertState {
+  bool current;
+  bool previous;
+  
+  void update(bool condition) {
+    previous = current;
+    current = condition;
+  }
+  
+  bool isRisingEdge() const {
+    return current && !previous;
+  }
+  
+  bool isActive() const {
+    return current;
+  }
+};
+
+// ==== Alert States ====
+AlertState gasAlert;
+AlertState motionAlert;
+AlertState flameAlert;
+AlertState tempAlert;
+AlertState systemAlert;
 
 // -----------------------------------------------------
 // Function declarations
@@ -140,7 +157,7 @@ bool prevTempAlertState = false;
 void initializeSystem();
 SensorData readSensors();
 bool checkForAlerts();
-void updateAlertStates();
+void updateAllAlertStates();
 void logSensorData();
 void updateDisplay();
 void handleLocalAlert();
@@ -156,12 +173,15 @@ bool isReceivingImage();
 
 void handleTelegramCommands();
 void handleTelegramNotifications();
+void checkAndSendAlertMessages();
+void sendSensorDataIfRequested();
+void sendCapturedImageIfReady();
 void sendPhotoToTelegram(uint8_t* buffer, size_t length);
 
 void freeImageBuffer(ImageData &image);
 
-void logStatus(const char* message);
-void logStatusf(const char* format, ...);
+void logDebug(const char* message);
+void logDebugf(const char* format, ...);
 
 // -----------------------------------------------------
 // Setup
@@ -179,7 +199,7 @@ void loop() {
   currentSensorData = readSensors();
 
   // Update global alert states once
-  updateAlertStates();  
+  updateAllAlertStates();  
 
   //logSensorData();
   updateDisplay();
@@ -216,7 +236,7 @@ void initializeSystem() {
   CameraSerial.setRxBufferSize(1024);  // increase RX buffer size
   CameraSerial.setTxBufferSize(1024);  // increase TX buffer size
   CameraSerial.begin(UART_BAUD_RATE, SERIAL_8N1, CameraPin_RX, CameraPin_TX);
-  logStatus("Camera UART initialized");
+  logDebug("Camera UART initialized");
   sendCommandToCamera(BLINK_CMD); // Blink camera LED to indicate ready
 
   // Initialize OLED
@@ -228,7 +248,7 @@ void initializeSystem() {
   
 
   // Wi-Fi connection
-  logStatus("Connecting to Wi-Fi");
+  logDebug("Connecting to Wi-Fi");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   display.drawString(2,2,"Connecting to Wifi...");
   display.display();
@@ -236,14 +256,14 @@ void initializeSystem() {
     delay(500);
     Serial.print(".");
   }
-  logStatus("Connected!");
+  logDebug("Connected!");
 
   client.setInsecure(); // skip certificate check
   bot.sendMessage(TELEGRAM_CHAT_ID, "ESP32 Safety System is online!", "");
 
   // Initialise ThingSpeak
   ThingSpeak.begin(client);
-  logStatus("ThingSpeak initialised");
+  logDebug("ThingSpeak initialised");
 
   delay(2000);
 }
@@ -265,38 +285,32 @@ SensorData readSensors() {
 // Check for any alerts based on sensor data
 // -----------------------------------------------------
 bool checkForAlerts() {
-  return gasAlertState || motionAlertState || flameAlertState || tempAlertState;
+  return gasAlert.isActive() || motionAlert.isActive() || 
+         flameAlert.isActive() || tempAlert.isActive();
 }
 
 // -----------------------------------------------------
 // Update global alert states from sensor data
 // -----------------------------------------------------
-void updateAlertStates() {
-  // Store previous states for edge detection
-  prevGasAlertState = gasAlertState;
-  prevMotionAlertState = motionAlertState;
-  prevFlameAlertState = flameAlertState;
-  prevTempAlertState = tempAlertState;
-  prevSystemAlertState = systemAlertState;
-  
-  // Update current states
-  gasAlertState = currentSensorData.gasValue > GAS_THRESHOLD;
-  motionAlertState = currentSensorData.motionDetected;
-  flameAlertState = currentSensorData.flameDetected;
-  tempAlertState = (currentSensorData.temperature < TEMP_MIN || currentSensorData.temperature > TEMP_MAX);
-  systemAlertState = checkForAlerts();
+void updateAllAlertStates() {
+  gasAlert.update(currentSensorData.gasValue > GAS_THRESHOLD);
+  motionAlert.update(currentSensorData.motionDetected);
+  flameAlert.update(currentSensorData.flameDetected);
+  tempAlert.update(currentSensorData.temperature < TEMP_MIN || 
+                   currentSensorData.temperature > TEMP_MAX);
+  systemAlert.update(checkForAlerts());
 }
 
 // -----------------------------------------------------
 // Log sensor data to Serial
 // -----------------------------------------------------
 void logSensorData() {
-  logStatusf("Gas: %d | Motion: %s | Flame: %s | Temp: %.1f°C%s",
+  logDebugf("Gas: %d | Motion: %s | Flame: %s | Temp: %.1f°C%s",
            currentSensorData.gasValue,
            currentSensorData.motionDetected ? "YES" : "NO",
            currentSensorData.flameDetected ? "YES" : "NO",
            currentSensorData.temperature,
-           systemAlertState ? " [ALERT]" : "");
+           systemAlert.isActive() ? " [ALERT]" : "");
 }
 
 // -----------------------------------------------------
@@ -326,38 +340,51 @@ void updateDisplay() {
     display.drawString(13,5,"%");
   }
   display.inverse();
-  display.drawString(2,7, systemAlertState ? "ALERT!" : "Status OK"); // first line
+  display.drawString(2,7, systemAlert.isActive() ? "ALERT!" : "Status OK");
   display.display();
 }
 
 void handleLocalAlert() {
-  digitalWrite(ledPin, systemAlertState ? HIGH : LOW);
-  //digitalWrite(buzzerPin, systemAlertState ? HIGH : LOW);
+  digitalWrite(ledPin, systemAlert.isActive() ? HIGH : LOW);
+  //digitalWrite(buzzerPin, systemAlert.isActive() ? HIGH : LOW);
 }
 
 // -----------------------------------------------------
-// Update ThingSpeak
+// Update ThingSpeak 
 // -----------------------------------------------------
+template <typename T>
+void updateThingSpeakField(const AlertState& alert, Field<T>& field, const T& currentField) {
+  if (!alert.isActive() && !field.frozen) {
+    field.value = currentField;
+  } else if (alert.isRisingEdge()) {
+    field.value = currentField;
+    field.frozen = true;
+  }
+}
+
 void updateThingSpeakSensorData() {
-  // Gas
-  if (!(thingSpeakSensorData.gasValue > GAS_THRESHOLD)) {
-    thingSpeakSensorData.gasValue = currentSensorData.gasValue;
-  }
+  updateThingSpeakField(gasAlert, 
+                        thingSpeakSensorData.gasValue, 
+                        currentSensorData.gasValue);
+  
+  updateThingSpeakField(tempAlert, 
+                        thingSpeakSensorData.temperature, 
+                        currentSensorData.temperature);
+  
+  updateThingSpeakField(motionAlert, 
+                        thingSpeakSensorData.motionDetected, 
+                        currentSensorData.motionDetected);
+  
+  updateThingSpeakField(flameAlert, 
+                        thingSpeakSensorData.flameDetected, 
+                        currentSensorData.flameDetected);
+}
 
-  // Temperature
-  if (!((thingSpeakSensorData.temperature < TEMP_MIN || thingSpeakSensorData.temperature > TEMP_MAX))) {
-    thingSpeakSensorData.temperature = currentSensorData.temperature;
-  }
-
-  // Motion
-  if (!(thingSpeakSensorData.motionDetected)) {
-    thingSpeakSensorData.motionDetected = currentSensorData.motionDetected;
-  }
-
-  // Flame
-  if (!(thingSpeakSensorData.flameDetected)) {
-    thingSpeakSensorData.flameDetected = currentSensorData.flameDetected;
-  }
+void resetThingSpeakAfterSend() {
+  thingSpeakSensorData.gasValue.frozen = false;
+  thingSpeakSensorData.motionDetected.frozen = false;
+  thingSpeakSensorData.flameDetected.frozen = false;
+  thingSpeakSensorData.temperature.frozen = false;
 }
 
 void sendToThingSpeak() {
@@ -365,42 +392,41 @@ void sendToThingSpeak() {
   unsigned long now = millis();
 
   if (now - lastSendTime < COOLDOWN) {
-    // Cooldown not over yet — skip sending
     return;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    logStatus("Cannot update ThingSpeak - WiFi not connected");
+    logDebug("Cannot update ThingSpeak - WiFi not connected");
     return;
   }
 
   if (!client.connect("api.thingspeak.com", 443)) {
-    logStatus("Connection to ThingSpeak failed");
+    logDebug("Connection to ThingSpeak failed");
     return;
   }
 
   // Build the request URL
   String url = "/update?api_key=" + String(THINGSPEAK_API_KEY);
-  url += "&field" + String(FIELD_GAS) + "=" + String(thingSpeakSensorData.gasValue, 2)
-  += "&field" + String(FIELD_TEMPERATURE) + "=" + String(thingSpeakSensorData.temperature, 2)
-  += "&field" + String(FIELD_MOTION) + "=" + String(thingSpeakSensorData.motionDetected ? 1 : 0, 2)
-  += "&field" + String(FIELD_FLAME) + "=" + String(thingSpeakSensorData.flameDetected ? 1 : 0, 2); 
+  url += "&field" + String(FIELD_GAS) + "=" + String(thingSpeakSensorData.gasValue.value, 2)
+      + "&field" + String(FIELD_TEMPERATURE) + "=" + String(thingSpeakSensorData.temperature.value, 2)
+      + "&field" + String(FIELD_MOTION) + "=" + String(thingSpeakSensorData.motionDetected.value ? 1 : 0, 2)
+      + "&field" + String(FIELD_FLAME) + "=" + String(thingSpeakSensorData.flameDetected.value ? 1 : 0, 2); 
+  
   // Build the GET request
   String request = String("GET ") + url + " HTTP/1.1\r\n" +
                    "Host: api.thingspeak.com\r\n" +
                    "Connection: close\r\n\r\n";
 
-  logStatusf("Sending to ThingSpeak: %s", url.c_str());
+  logDebugf("Sending to ThingSpeak: %s", url.c_str());
   client.print(request);
 
-  // Optionally read response (the channel entry number or 0 if failed)
+  // Optionally read response
   String response = client.readString();
-  logStatusf("ThingSpeak response: %s", response.c_str());
+  logDebugf("ThingSpeak response: %s", response.c_str());
   client.stop();
 
   lastSendTime = now;
-  thingSpeakSensorData = {0, false, false, TEMP_MIN};
-
+  resetThingSpeakAfterSend();
 }
 
 
@@ -410,31 +436,23 @@ void sendToThingSpeak() {
 void manageCameraCapture() {
   switch(cameraState) {
     case CAM_IDLE:
-      // Check if we should request a capture
       if (shouldRequestCapture()) {
-        // reset command flag
         telegramCommandTakePicture = false; 
-
-        // Send capture command
         sendCommandToCamera(CAPTURE_CMD);
-
-        // Move to waiting state
         cameraState = CAM_WAITING_FOR_IMAGE;
-        logStatus("State: WAITING_FOR_IMAGE");
+        logDebug("State: WAITING_FOR_IMAGE");
       }
       break;
       
     case CAM_WAITING_FOR_IMAGE:
-      // Try to receive image data (non-blocking)
       if (tryReceiveImageData()) {
         cameraState = CAM_IMAGE_READY;
-        logStatus("State: IMAGE_READY");
+        logDebug("State: IMAGE_READY");
       }
       break;
       
     case CAM_IMAGE_READY:
       // Image will be sent by Telegram handler
-      // State will be reset to IDLE after sending
       break;
   }
 }
@@ -443,11 +461,9 @@ void manageCameraCapture() {
 // Check if capture should be requested
 // -----------------------------------------------------
 bool shouldRequestCapture() {
-  // Request capture on rising edge (alert just turned on)
-  bool flameTriggered = flameAlertState && !prevFlameAlertState;
-  bool motionTriggered = motionAlertState && !prevMotionAlertState;
-  
-  return flameTriggered || motionTriggered || telegramCommandTakePicture;
+  return flameAlert.isRisingEdge() || 
+         motionAlert.isRisingEdge() || 
+         telegramCommandTakePicture;
 }
 
 // -----------------------------------------------------
@@ -455,7 +471,7 @@ bool shouldRequestCapture() {
 // -----------------------------------------------------
 void sendCommandToCamera(char command) {
   CameraSerial.write(command);
-  logStatusf("Command sent to camera: %c", command);
+  logDebugf("Command sent to camera: %c", command);
 }
 
 // -----------------------------------------------------
@@ -464,54 +480,54 @@ void sendCommandToCamera(char command) {
 bool tryReceiveImageData() {
   static enum {WAIT_START, READ_SIZE, READ_DATA, WAIT_END} receiveState = WAIT_START;
   static uint32_t expectedSize = 0;
-  static uint32_t lastByteTime = 0; // last time a byte was received
+  static uint32_t lastByteTime = 0;
   const size_t CHUNK_SIZE = 1024;
-  const unsigned long  CHUNK_TIMEOUT_MS = 15000; // 15 seconds timeout
+  const unsigned long CHUNK_TIMEOUT_MS = 15000;
 
   while (CameraSerial.available() > 0) {
     char incomingByte = CameraSerial.read();
-    lastByteTime = millis(); // reset timeout counter whenever a byte arrives
+    lastByteTime = millis();
     
     switch(receiveState) {
       case WAIT_START:
         if (incomingByte == RESPONSE_START) {
-          logStatus("Received START marker");
+          logDebug("Received START marker");
           receiveState = READ_SIZE;
           expectedSize = 0;
         } else if (incomingByte == RESPONSE_ERROR) {
-          logStatus("Camera reported error");
+          logDebug("Camera reported error");
           receiveState = WAIT_START;
           return false;
         }
         break;
         
       case READ_SIZE:
-        // Read 4 bytes for size (little-endian)
-        static uint8_t sizeBytes[4];
-        static uint8_t sizeBytesRead = 0;
-        
-        sizeBytes[sizeBytesRead++] = incomingByte;
-        
-        if (sizeBytesRead == 4) {
-          expectedSize = (uint32_t)sizeBytes[0] |
-                        ((uint32_t)sizeBytes[1] << 8) |
-                        ((uint32_t)sizeBytes[2] << 16) |
-                        ((uint32_t)sizeBytes[3] << 24);
+        {
+          static uint8_t sizeBytes[4];
+          static uint8_t sizeBytesRead = 0;
           
-          logStatusf("Expected image size: %d bytes", expectedSize);
+          sizeBytes[sizeBytesRead++] = incomingByte;
           
-          // Allocate buffer for image
-          capturedImage.buffer = (uint8_t*)malloc(expectedSize);
-          if (capturedImage.buffer == NULL) {
-            logStatus("Failed to allocate image buffer!");
-            receiveState = WAIT_START;
-            return false;
+          if (sizeBytesRead == 4) {
+            expectedSize = (uint32_t)sizeBytes[0] |
+                          ((uint32_t)sizeBytes[1] << 8) |
+                          ((uint32_t)sizeBytes[2] << 16) |
+                          ((uint32_t)sizeBytes[3] << 24);
+            
+            logDebugf("Expected image size: %d bytes", expectedSize);
+            
+            capturedImage.buffer = (uint8_t*)malloc(expectedSize);
+            if (capturedImage.buffer == NULL) {
+              logDebug("Failed to allocate image buffer!");
+              receiveState = WAIT_START;
+              return false;
+            }
+            
+            capturedImage.size = expectedSize;
+            capturedImage.bytesRead = 0;
+            receiveState = READ_DATA;
+            sizeBytesRead = 0;
           }
-          
-          capturedImage.size = expectedSize;
-          capturedImage.bytesRead = 0;
-          receiveState = READ_DATA;
-          sizeBytesRead = 0;
         }
         break;
         
@@ -519,22 +535,19 @@ bool tryReceiveImageData() {
         capturedImage.buffer[capturedImage.bytesRead++] = incomingByte;
         capturedImage.progress = (float)capturedImage.bytesRead / capturedImage.size * 100.0;
 
-        // Send ACK for every CHUNK_SIZE bytes received
         if (capturedImage.bytesRead % CHUNK_SIZE == 0 || capturedImage.bytesRead == capturedImage.size) {
             sendCommandToCamera(RESPONSE_ACK);
         }
-        
-        //logStatusf("Image receive pending: %.1f%%, %d bytes", capturedImage.progress, capturedImage.bytesRead);
 
         if (capturedImage.bytesRead >= capturedImage.size) {
-          logStatusf("Received all %d bytes", capturedImage.bytesRead);
+          logDebugf("Received all %d bytes", capturedImage.bytesRead);
           receiveState = WAIT_END;
         }
         break;
         
       case WAIT_END:
         if (incomingByte == RESPONSE_END) {
-          logStatus("Received END marker - Image complete!");
+          logDebug("Received END marker - Image complete!");
           capturedImage.available = true;
           receiveState = WAIT_START;
           return true;
@@ -544,17 +557,17 @@ bool tryReceiveImageData() {
   }
   
   // Check timeout
-    if ((receiveState != WAIT_START) && (millis() - lastByteTime > CHUNK_TIMEOUT_MS)) {
-        logStatus("❌ Timeout waiting for image data");
-        receiveState = WAIT_START;
-        if (capturedImage.buffer) {
-            free(capturedImage.buffer);
-            capturedImage.buffer = nullptr;
-        }
-        cameraState = CAM_IDLE;
-        return false;
+  if ((receiveState != WAIT_START) && (millis() - lastByteTime > CHUNK_TIMEOUT_MS)) {
+    logDebug("❌ Timeout waiting for image data");
+    receiveState = WAIT_START;
+    if (capturedImage.buffer) {
+      free(capturedImage.buffer);
+      capturedImage.buffer = nullptr;
     }
+    cameraState = CAM_IDLE;
     return false;
+  }
+  return false;
 }
 
 bool isReceivingImage() {
@@ -574,7 +587,7 @@ void handleTelegramCommands() {
     for (int i = 0; i < numNewMessages; i++) {
       String chat_id = bot.messages[i].chat_id;
       String text = bot.messages[i].text;
-      text.toLowerCase(); // easier command matching
+      text.toLowerCase();
 
       if (text == "/temp" || text == "/temperature") {
         telegramCommandSendTemp = true;
@@ -597,37 +610,47 @@ void handleTelegramCommands() {
 }
 
 // -----------------------------------------------------
-// Telegram notification logic
+// Telegram notification logic 
 // -----------------------------------------------------
 void handleTelegramNotifications() {
+  checkAndSendAlertMessages();
+  sendSensorDataIfRequested();
+  sendCapturedImageIfReady();
+}
+
+void checkAndSendAlertMessages() {
   String message = "";
 
-  // Check for new alerts (rising edge detection)
-  if (gasAlertState && !prevGasAlertState) {
+  if (gasAlert.isRisingEdge()) {
     message += "⚠️ Gas alert detected!\n";
   }
-  if (motionAlertState && !prevMotionAlertState) {
+  if (motionAlert.isRisingEdge()) {
     message += "⚠️ Motion detected!\n";
   }
-  if (flameAlertState && !prevFlameAlertState) {
+  if (flameAlert.isRisingEdge()) {
     message += "🔥 Flame detected!\n";
   }
-  if (tempAlertState && !prevTempAlertState) {
+  if (tempAlert.isRisingEdge()) {
     message += "🌡️ Temperature out of range!\n";
-  }
-  if(telegramCommandSendTemp){
-    message += "🌡️ Current Temperature: ";
-    char tempStr[8];
-    dtostrf(currentSensorData.temperature, 0, 1, tempStr);
-    message += String(tempStr) + "°C\n";
-    telegramCommandSendTemp = false;
   }
 
   if (message.length() > 0) {
     bot.sendMessage(TELEGRAM_CHAT_ID, message, "");
   }
+}
 
-  // Send image if available
+void sendSensorDataIfRequested() {
+  if (telegramCommandSendTemp) {
+    String message = "🌡️ Current Temperature: ";
+    char tempStr[8];
+    dtostrf(currentSensorData.temperature, 0, 1, tempStr);
+    message += String(tempStr) + "°C\n";
+    bot.sendMessage(TELEGRAM_CHAT_ID, message, "");
+    telegramCommandSendTemp = false;
+  }
+}
+
+void sendCapturedImageIfReady() {
   if (capturedImage.available && cameraState == CAM_IMAGE_READY) {
     sendPhotoToTelegram(capturedImage.buffer, capturedImage.size);
     freeImageBuffer(capturedImage);
@@ -639,14 +662,13 @@ void handleTelegramNotifications() {
 // Telegram Photo logic
 // -----------------------------------------------------
 void sendPhotoToTelegram(uint8_t* buffer, size_t length) {
-
   if (!buffer || length == 0) {
-    logStatus("No image data to send!");
+    logDebug("No image data to send!");
     return;
   }
 
   if (!client.connect(telegramHost, 443)) {
-    logStatus("Connection to Telegram failed!");
+    logDebug("Connection to Telegram failed!");
     return;
   }
 
@@ -672,47 +694,44 @@ void sendPhotoToTelegram(uint8_t* buffer, size_t length) {
   client.write(buffer, length);
   client.print(tail);
 
-  // --- Read Telegram server response (optional) ---
   while (client.connected()) {
     String line = client.readStringUntil('\n');
     if (line == "\r") break;
   }
 
   String response = client.readString();
-  Serial.println("[MAIN] Telegram response:");
+  logDebug("[MAIN] Telegram response:");
   Serial.println(response);
 
-   client.stop();
+  client.stop();
 }
 
 // -----------------------------------------------------
 // Free the captured image buffer and reset the ImageData struct
 // -----------------------------------------------------
 void freeImageBuffer(ImageData &image) {
-    if (image.buffer != nullptr) {
-        free(image.buffer);       // Free the allocated memory
-        image.buffer = nullptr;   // Avoid dangling pointer
-    }
-    image.size = 0;
-    image.bytesRead = 0;
-    image.progress = 0.0f;
-    image.available = false;
+  if (image.buffer != nullptr) {
+    free(image.buffer);
+    image.buffer = nullptr;
+  }
+  image.size = 0;
+  image.bytesRead = 0;
+  image.progress = 0.0f;
+  image.available = false;
 }
-
 
 // -----------------------------------------------------
 // Logging Functions
 // -----------------------------------------------------
-void logStatus(const char* message) {
-  if(!DEBUG) return; // Skip if debugging is disabled
-
+void logDebug(const char* message) {
+  if (!DEBUG) return;
   Serial.print("[MAIN] ");
   Serial.println(message);
 }
 
-void logStatusf(const char* format, ...) {
-  if(!DEBUG) return; // Skip if debugging is disabled
-
+void logDebugf(const char* format, ...) {
+  if (!DEBUG) return;
+  
   char buffer[256];
   va_list args;
   va_start(args, format);
