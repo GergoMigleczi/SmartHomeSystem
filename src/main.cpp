@@ -434,11 +434,11 @@ void updateDisplay() {
  */
 template <typename T>
 void updateThingSpeakField(const AlertState& alert, Field<T>& field, const T& currentField) {
-  if (!alert.isActive() && !field.frozen) {
-    field.value = currentField;
-  } else if (alert.isRisingEdge()) {
+  if(alert.isActive()){
     field.value = currentField;
     field.frozen = true;
+  } elseif (!field.frozen){
+    field.value = currentField;
   }
 }
 
