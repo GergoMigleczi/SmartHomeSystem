@@ -100,6 +100,7 @@ const unsigned long TELEGRAM_INTERVAL = 2000;
 
 bool telegramCommandTakePicture = false;
 bool telegramCommandSendTemp = false;
+bool telegramCommandSendHelp = false;
 
 // =====================================================
 // ================== ThingSpeak =======================
@@ -747,11 +748,7 @@ void handleTelegramCommands() {
         telegramCommandTakePicture = true;
       }
       else if (text == "/help") {
-        // --- Build help message dynamically for flexibility ---
-        String help = "Available commands:\n";
-        help += "/temp or /temperature - Get current temperature\n";
-        help += "/pic or /picture or /image - Take a photo";
-        bot.sendMessage(chat_id, help, "");
+        telegramCommandSendHelp = true;
       } 
       else {
         // --- Handle unknown input ---
@@ -808,6 +805,15 @@ void sendSensorDataIfRequested() {
     message += String(tempStr) + "°C\n";
     bot.sendMessage(TELEGRAM_CHAT_ID, message, "");
     telegramCommandSendTemp = false;
+  }
+
+  if (telegramCommandSendHelp) {
+    String helpMessage = "🤖 Available Commands:\n"
+                         "/temp or /temperature - Get current temperature\n"
+                         "/pic or /picture or /image - Capture and send a picture\n"
+                         "/help - Show this help message";
+    bot.sendMessage(TELEGRAM_CHAT_ID, helpMessage, "");
+    telegramCommandSendHelp = false;
   }
 }
 
