@@ -243,7 +243,7 @@ bool isReceivingImage();
 void handleTelegramCommands();
 void handleTelegramNotifications();
 void checkAndSendAlertMessages();
-void sendSensorDataIfRequested();
+void sendCommandResponses();
 void sendCapturedImageIfReady();
 void sendPhotoToTelegram(uint8_t* buffer, size_t length);
 
@@ -766,7 +766,7 @@ void handleTelegramCommands() {
  */
 void handleTelegramNotifications() {
   checkAndSendAlertMessages();
-  sendSensorDataIfRequested();
+  sendCommandResponses();
   sendCapturedImageIfReady();
 }
 
@@ -797,7 +797,7 @@ void checkAndSendAlertMessages() {
 /**
  * @brief  Sends temperature data to Telegram if requested by user.
  */
-void sendSensorDataIfRequested() {
+void sendCommandResponses() {
   if (telegramCommandSendTemp) {
     String message = "🌡️ Current Temperature: ";
     char tempStr[8];
