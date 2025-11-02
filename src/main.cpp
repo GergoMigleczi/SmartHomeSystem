@@ -105,7 +105,7 @@ bool telegramCommandSendTemp = false;
 // ================== ThingSpeak =======================
 // =====================================================
 
-const unsigned long COOLDOWN = 30000; // 30s delay between updates
+const unsigned long COOLDOWN = 20000; // 20s delay between updates
 int FIELD_GAS = 1;
 int FIELD_TEMPERATURE = 2;
 int FIELD_FLAME = 3;
