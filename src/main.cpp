@@ -437,7 +437,7 @@ void updateThingSpeakField(const AlertState& alert, Field<T>& field, const T& cu
   if(alert.isActive()){
     field.value = currentField;
     field.frozen = true;
-  } elseif (!field.frozen){
+  } else if (!field.frozen){
     field.value = currentField;
   }
 }
