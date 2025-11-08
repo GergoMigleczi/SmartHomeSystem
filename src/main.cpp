@@ -1,5 +1,5 @@
 /**
- * @file        main.ccp
+ * @file        main.cpp
  * @brief       ESP32 Safety System with Telegram, ThingSpeak, and Camera Integration.
  * @details     Monitors gas, flame, motion, and temperature sensors, displays status on OLED, 
  *              and sends alerts via Telegram and ThingSpeak. Captures images on alerts or user command.
